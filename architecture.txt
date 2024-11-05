@@ -1,0 +1,14 @@
+Face Recognition:
+
+YOLOX - CNN Model
+Classify th images
+detect, classify, model
+
+Sound Part:
+1)Speaker Diarization --- pyannote/speaker-diarization --- pre-trained
+2)Automatic Speech Recognition --- seq2seq -- Speech2Text ---- Transformers-- HF
+AutoEncoder ---
+
+Summary/QA Bot:
+1)Question and AnsweringTask
+2)Context is forme
