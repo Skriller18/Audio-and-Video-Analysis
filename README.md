@@ -11,8 +11,7 @@ git clone https://github.com/Skriller18/Audio-and-Video-Analysis.git
 
 Install the needed requirements
 ```bash
-pip install -r requirements.txt
-```
+pip install face_recognition streamlit opencv-python-headless numpy pydub torch sounddevice wave openai-whisper openai Pillow pyannote.audio mtcnn```
 
 Load the images if you have into the faces folder by keeping the name of the image as the name of the label
 ```bash
