@@ -11,9 +11,8 @@ import io
 import torch
 import sounddevice as sd
 import wave
-
-cuda_available = torch.cuda.is_available()
-device = torch.device("cuda" if cuda_available else "cpu")
+import gc
+import os
 
 class VideoProcessor:
     def __init__(self, known_face_encodings, known_face_names):
@@ -61,32 +60,109 @@ class VideoProcessor:
 
 class AudioProcessor:
     def __init__(self):
-        self.pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization", use_auth_token="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")
-        self.pipeline.to(device)
-        self.model = whisper.load_model("small", device=device)
+        self.pipeline = None
+        self.model = None
+
+    def initialize_models(self, device):
+        if self.pipeline is None:
+            # Monkey patch numpy.NAN before importing Pipeline
+            import numpy as np
+            if not hasattr(np, 'NAN'):
+                np.NAN = float('nan')
+            
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization", 
+                use_auth_token="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"
+            )
+            self.pipeline.to(device)
+        
+        if self.model is None:
+            self.model = whisper.load_model("small", device=device)
+
+    def cleanup(self):
+        try:
+            if self.pipeline is not None:
+                del self.pipeline
+                self.pipeline = None
+            
+            if self.model is not None:
+                del self.model
+                self.model = None
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            print(f"Error during cleanup: {str(e)}")
 
     def process_audio(self, audio_path, language):
-        audio = AudioSegment.from_file(audio_path)
-        audio.export("processed_audio.wav", format="wav")
+        try:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.initialize_models(device)
 
-        diarization = self.pipeline("processed_audio.wav")
+            # Convert input audio to wav format
+            audio = AudioSegment.from_file(audio_path)
+            temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+            audio.export(temp_wav.name, format="wav")
 
-        audio = AudioSegment.from_wav("processed_audio.wav")
-        audio = audio.set_frame_rate(16000)
+            # Perform diarization
+            try:
+                diarization = self.pipeline(temp_wav.name)
+            except Exception as e:
+                st.error(f"Diarization failed: {str(e)}")
+                return "Error: Could not perform speaker diarization"
 
-        transcript = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            start = int(turn.start * 1000)
-            end = int(turn.end * 1000)
+            # Process audio for transcription
+            audio = AudioSegment.from_wav(temp_wav.name)
+            audio = audio.set_frame_rate(16000)
 
-            segment = audio[start:end]
-            segment.export("segment.wav", format="wav")
-            result = self.model.transcribe("segment.wav", language=language)
+            transcript = []
+            try:
+                for turn, _, speaker in diarization.itertracks(yield_label=True):
+                    start = int(turn.start * 1000)
+                    end = int(turn.end * 1000)
+
+                    # Extract segment
+                    segment = audio[start:end]
+                    temp_segment = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                    segment.export(temp_segment.name, format="wav")
+                    
+                    # Transcribe segment
+                    try:
+                        result = self.model.transcribe(temp_segment.name, language=language)
+                        if result and 'text' in result:
+                            transcript.append(f"Speaker {speaker}: {result['text'].strip()}")
+                    except Exception as e:
+                        st.warning(f"Failed to transcribe segment: {str(e)}")
+                        continue
+                    finally:
+                        # Clean up segment file
+                        temp_segment.close()
+                        if os.path.exists(temp_segment.name):
+                            os.unlink(temp_segment.name)
+
+            except Exception as e:
+                st.error(f"Error processing audio segments: {str(e)}")
+                return "Error: Failed to process audio segments"
+
+            if not transcript:
+                return "No speech detected or transcription failed"
+
+            return "\n".join(transcript)
+        
+        except Exception as e:
+            st.error(f"General transcription error: {str(e)}")
+            return f"Error: {str(e)}"
+        
+        finally:
+            # Clean up temporary wav file
+            if 'temp_wav' in locals():
+                temp_wav.close()
+                if os.path.exists(temp_wav.name):
+                    os.unlink(temp_wav.name)
             
-            transcript.append(f"Speaker {speaker}: {result['text']}")
-
-        return "\n".join(transcript)
+            # Clean up models and GPU memory
+            self.cleanup()
 
 def record_audio(duration=5, sample_rate=16000):
     st.write("Recording...")
@@ -94,79 +170,118 @@ def record_audio(duration=5, sample_rate=16000):
     sd.wait()
     st.write("Recording finished.")
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
-        wavefile = wave.open(temp_audio_file.name, 'wb')
+    temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    with wave.open(temp_audio_file.name, 'wb') as wavefile:
         wavefile.setnchannels(1)
         wavefile.setsampwidth(2)
         wavefile.setframerate(sample_rate)
         wavefile.writeframes(recording.tobytes())
-        wavefile.close()
-        return temp_audio_file.name
+    return temp_audio_file.name
+
+def process_video(video_source):
+    video_capture = None
+    try:
+        if video_source == "Upload Video":
+            video_file = st.file_uploader("Upload Video", type=["mp4", "avi"])
+            if video_file:
+                temp_video_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                temp_video_file.write(video_file.read())
+                temp_video_file.close()
+                video_capture = cv2.VideoCapture(temp_video_file.name)
+                os.unlink(temp_video_file.name)
+        else:  # Use Webcam
+            video_capture = cv2.VideoCapture(0)
+
+        if video_capture is not None and video_capture.isOpened():
+            try:
+                known_face_encodings = np.load('encodings.npy')
+                with open('string_array.txt', 'r') as file:
+                    known_face_names = [line.strip() for line in file]
+
+                video_processor = VideoProcessor(known_face_encodings, known_face_names)
+                stframe = st.empty()
+
+                while True:
+                    ret, frame = video_capture.read()
+                    if not ret:
+                        break
+
+                    processed_frame = video_processor.process_frame(frame)
+                    img_array = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+                    pil_image = Image.fromarray(img_array)
+                    stframe.image(pil_image, caption="Processed Frame", use_container_width=True)
+
+            except Exception as e:
+                st.error(f"Error processing video: {str(e)}")
+
+    finally:
+        if video_capture is not None:
+            video_capture.release()
 
 def main():
     st.title("Video and Audio Processor")
 
-    video_capture = None
-
-    # Video Source Selection
-    video_source = st.radio("Select Video Source", ("Upload Video", "Use Webcam"))
-    
-    if video_source == "Upload Video":
-        video_file = st.file_uploader("Upload Video", type=["mp4", "avi"])
-        if video_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
-                temp_video_file.write(video_file.read())
-                temp_video_path = temp_video_file.name
-            video_capture = cv2.VideoCapture(temp_video_path)
-    else:
-        video_capture = cv2.VideoCapture(0)
-    
-    if video_capture is not None and video_capture.isOpened():
-        known_face_encodings = np.load('encodings.npy')
-        with open('string_array.txt', 'r') as file:
-            known_face_names = [line.strip() for line in file]
-
-        video_processor = VideoProcessor(known_face_encodings, known_face_names)
-
-        stframe = st.empty()
-        while True:
-            ret, frame = video_capture.read()
-            if not ret:
-                break
-            processed_frame = video_processor.process_frame(frame)
-            _, buffer = cv2.imencode('.jpg', processed_frame)
-            image = Image.open(io.BytesIO(buffer))
-            stframe.image(image, caption="Processed Frame", use_column_width=True)
-        
-        video_capture.release()
-
-    # Initialize session state for audio_path
+    # Initialize session states
+    if "audio_processor" not in st.session_state:
+        st.session_state.audio_processor = None
     if "audio_path" not in st.session_state:
-        st.session_state["audio_path"] = None
+        st.session_state.audio_path = None
+    if "transcription_requested" not in st.session_state:
+        st.session_state.transcription_requested = False
 
-    # Audio Source Selection
+    # Video Section
+    st.header("Video Processing")
+    video_source = st.radio("Select Video Source", ("Upload Video", "Use Webcam"))
+    process_video(video_source)
+
+    # Audio Section
+    st.header("Audio Processing")
     audio_source = st.radio("Select Audio Source", ("Upload Audio", "Record Audio"))
     
     if audio_source == "Upload Audio":
         audio_file = st.file_uploader("Upload Audio", type=["wav", "mp3"])
         if audio_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio_file:
-                temp_audio_file.write(audio_file.read())
-                st.session_state["audio_path"] = temp_audio_file.name
+            temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            temp_audio_file.write(audio_file.read())
+            st.session_state.audio_path = temp_audio_file.name
+            temp_audio_file.close()
+
     elif audio_source == "Record Audio":
         duration = st.slider("Recording Duration (seconds)", 1, 10, 5)
         if st.button("Start Recording"):
-            st.session_state["audio_path"] = record_audio(duration)
+            st.session_state.audio_path = record_audio(duration)
 
-    if st.session_state["audio_path"]:
-        st.audio(st.session_state["audio_path"], format='audio/wav')
+    if st.session_state.audio_path:
+        st.audio(st.session_state.audio_path, format='audio/wav')
 
         language_option = st.selectbox("Select Language", ["English", "Hindi"])
         language_code = "hi" if language_option == "Hindi" else "en"
 
-        audio_processor = AudioProcessor()
-        transcript = audio_processor.process_audio(st.session_state["audio_path"], language_code)
-        st.text_area("Transcript", transcript, height=300)
+        if st.button("Start Transcription"):
+            st.session_state.transcription_requested = True
+
+        if st.session_state.transcription_requested:
+            try:
+                with st.spinner("Transcribing audio..."):
+                    if st.session_state.audio_processor is None:
+                        st.session_state.audio_processor = AudioProcessor()
+                    
+                    transcript = st.session_state.audio_processor.process_audio(
+                        st.session_state.audio_path, 
+                        language_code
+                    )
+                    st.text_area("Transcript", transcript, height=300)
+                    
+                    # Clean up the temporary audio file
+                    if os.path.exists(st.session_state.audio_path):
+                        os.unlink(st.session_state.audio_path)
+                        st.session_state.audio_path = None
+                    
+                    st.session_state.transcription_requested = False
+                    
+            except Exception as e:
+                st.error(f"Error during transcription: {str(e)}")
+                st.session_state.transcription_requested = False
 
 if __name__ == "__main__":
     main()
