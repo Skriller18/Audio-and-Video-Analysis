@@ -1,4 +1,4 @@
-# Audio and Video Analysis
+# Audio and Video Analysis.
 
 This is an application that will do facial recognition for the people present in the video as well as transcibe video along with performing Speaker Diarization for the given audio.
 
